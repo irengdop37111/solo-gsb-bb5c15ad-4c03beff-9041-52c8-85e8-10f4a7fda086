@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke
+    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke/prep_voucher_issue/prep_voucher_revoke/dispense
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
@@ -73,6 +73,31 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 
 CREATE INDEX IF NOT EXISTS idx_shares_test ON shares(test_id);
+
+-- 单场制备凭证（负责人签发、制备员持有）：
+-- 同一时刻仅一份 active；撤销后可重签，旧凭证始终失效（读取/确认一律拒绝）。
+CREATE TABLE IF NOT EXISTS prep_vouchers (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id      INTEGER NOT NULL REFERENCES tests(id),
+    voucher_code TEXT NOT NULL UNIQUE,                -- 制备凭证（不记名能力凭证，明文存放，与盲评码同级）
+    issued_at    INTEGER NOT NULL,                    -- 签发时间（秒）
+    revoked_at   INTEGER,                             -- 撤销时间（秒）；NULL 表示当前有效
+    status       TEXT NOT NULL DEFAULT 'active'       -- active / revoked
+);
+
+CREATE INDEX IF NOT EXISTS idx_prep_vouchers_test ON prep_vouchers(test_id);
+
+-- 杯贴码：每位有效评员杯位 1～3 各一枚，只含随机码、不含任何样本信息。
+-- 评员撤回（未发放）时随分配一并删除使旧码失效；补位者取得全新杯贴码。
+CREATE TABLE IF NOT EXISTS cup_stickers (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id  INTEGER NOT NULL REFERENCES assignments(id),
+    pos            INTEGER NOT NULL,                  -- 杯位 1/2/3
+    sticker_code   TEXT NOT NULL UNIQUE,              -- 全局唯一杯贴码
+    UNIQUE(assignment_id, pos)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cup_stickers_assignment ON cup_stickers(assignment_id);
 """
 
 
@@ -96,6 +121,11 @@ def init_db():
                 "ALTER TABLE assignments ADD COLUMN status TEXT NOT NULL "
                 "DEFAULT 'active'"
             )
+        # 兼容旧库：为已存在的 assignments 表补制备发放时间列
+        if "dispensed_at" not in cols:
+            conn.execute(
+                "ALTER TABLE assignments ADD COLUMN dispensed_at INTEGER"
+            )
         # 兼容旧库：为已存在的 tests 表补提前结束相关列
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tests)")}
         if "ended_at" not in tcols:
@@ -105,9 +135,49 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
+    # 兼容旧库：杯贴码表上线前创建的分配没有杯贴码，按既有分配补齐（不改变任何分配）。
+    backfill_cup_stickers()
     # 兼容旧库：events 表上线前创建的测试没有任何操作记录。
     # 为每个这样的测试补一条明确的“记录起点”标记，不重建、不虚构既往操作。
     backfill_history_markers()
+
+
+def _new_sticker_code() -> str:
+    """不含易混字符的 URL 安全随机杯贴码（8 位）。"""
+    import secrets
+    alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+def backfill_cup_stickers():
+    """为缺少杯贴码的既有分配补齐杯位 1～3 的杯贴码（旧库升级，幂等）。
+
+    只补缺、不改动既有分配（odd_pos/odd_sample 与名单状态均不变）。
+    """
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT a.id AS assignment_id FROM assignments a WHERE NOT EXISTS ("
+            "SELECT 1 FROM cup_stickers c WHERE c.assignment_id = a.id)"
+        ).fetchall()
+        for r in rows:
+            for pos in (1, 2, 3):
+                # 全局 UNIQUE(sticker_code)：撞码（极小概率）则重取
+                while True:
+                    code = _new_sticker_code()
+                    if conn.execute(
+                        "SELECT 1 FROM cup_stickers WHERE sticker_code = ?",
+                        (code,),
+                    ).fetchone() is None:
+                        break
+                conn.execute(
+                    "INSERT INTO cup_stickers (assignment_id, pos, sticker_code) "
+                    "VALUES (?, ?, ?)",
+                    (r["assignment_id"], pos, code),
+                )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def backfill_history_markers():

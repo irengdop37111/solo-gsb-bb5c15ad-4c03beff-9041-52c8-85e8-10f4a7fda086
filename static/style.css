@@ -118,3 +118,16 @@ tr.miss td { background: #fef3f2; }
 a { color: var(--brand); }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 .small { font-size: 13px; }
+
+.panelist-box {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin: 14px 0;
+}
+.panelist-box.is-done { background: #fafbfc; opacity: 0.92; }
+.panelist-head {
+  display: flex; align-items: center; gap: 12px;
+  flex-wrap: wrap; margin-bottom: 8px;
+}
+.panelist-head b { font-size: 15.5px; }

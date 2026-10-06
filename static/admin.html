@@ -35,6 +35,8 @@ if (!code || !token) {
 document.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-revoke]');
   if (btn) revokeShare(btn.dataset.revoke, btn);
+  const prepBtn = e.target.closest('[data-prep-revoke]');
+  if (prepBtn) revokePrep(prepBtn);
 });
 
 async function load() {
@@ -68,6 +70,7 @@ function render(t) {
         <div class="stat"><div class="num">${t.progress.total}</div><div class="cap">评员总数</div></div>
         <div class="stat"><div class="num">${t.progress.submitted}</div><div class="cap">已提交(含弃权)</div></div>
         <div class="stat"><div class="num">${t.progress.valid}</div><div class="cap">有效答卷</div></div>
+        <div class="stat"><div class="num">${t.preparation ? t.preparation.dispensed : 0}</div><div class="cap">已发放实体样品</div></div>
         <div class="stat"><div class="num">${t.withdrawn_count || 0}</div><div class="cap">已撤回</div></div>
       </div>
       <p class="hint">截止前仅显示汇总计数，不显示任何评员的答案与三杯对应关系，以防泄露。</p>
@@ -77,6 +80,21 @@ function render(t) {
       </button>
       <div id="settleMsg"></div>
       <div id="report"></div>
+    </div>
+
+    <div class="card">
+      <h2>单场制备凭证 · 实体样品发放</h2>
+      <p class="hint">
+        签发一份<b>制备凭证</b>交给制备员：其可凭凭证查看当前有效评员
+        杯位 1～3 的<b>真实样本</b>与各杯<b>唯一杯贴码</b>，并按评员
+        <b>整组三杯</b>确认发放。<b>同一时刻仅一份有效</b>；撤销后可重签，
+        旧凭证立即失效（读取 / 确认都被拒绝）。已发放评员不可撤回；
+        ${t.preparation && t.preparation.closed
+          ? '<b>已到截止 / 已提前结束，禁止新发放；已发放记录保留至结算。</b>'
+          : '未发放评员撤回后杯贴码失效，补位者取得新杯贴码。'}
+        凭证与杯贴映射<b>不出现在评员页与结算前进度中</b>。
+      </p>
+      ${renderPrep(t)}
     </div>
 
     ${(!t.ended && !t.settled && !past) ? `
@@ -159,13 +177,15 @@ function render(t) {
       <h2>盲评码分发名单（仅负责人可见）</h2>
       <p class="hint">请将每人的专属链接单独发给本人；盲评码不可重复使用。</p>
       <table>
-        <thead><tr><th>评员</th><th>盲评码 / 专属链接</th></tr></thead>
+        <thead><tr><th>评员</th><th>盲评码 / 专属链接</th><th>实体样品</th></tr></thead>
         <tbody>
           ${t.codes.map(c => `
             <tr>
               <td>${esc(c.panelist)}</td>
               <td class="code">${esc(c.code)}
                 <a href="${esc(c.url)}" target="_blank" class="small">打开</a></td>
+              <td>${c.dispensed ? '<span class="badge ok">已发放</span>'
+                : '<span class="badge wait">未发放</span>'}</td>
             </tr>`).join('')}
         </tbody>
       </table>
@@ -190,7 +210,84 @@ function render(t) {
   if (endBtn) endBtn.addEventListener('click', doEnd);
   const shareBtn = document.getElementById('shareCreateBtn');
   if (shareBtn) shareBtn.addEventListener('click', doCreateShare);
+  const prepIssueBtn = document.getElementById('prepIssueBtn');
+  if (prepIssueBtn) prepIssueBtn.addEventListener('click', issuePrep);
   if (t.settled) doSettle();
+}
+
+function renderPrep(t) {
+  const p = t.preparation || { dispensed: 0, undispensed: 0, closed: true,
+    voucher_active: false, voucher_code: null };
+  const url = p.voucher_code ? `${location.origin}/prep/voucher/${p.voucher_code}` : '';
+  return `
+    <div class="stat-grid">
+      <div class="stat"><div class="num">${p.dispensed}</div><div class="cap">已整组发放</div></div>
+      <div class="stat"><div class="num">${p.undispensed}</div><div class="cap">未发放</div></div>
+    </div>
+    ${p.voucher_active ? `
+      <div class="callout ok">
+        当前有效凭证（仅负责人视角显示明文，请点对点交给制备员）：<br>
+        <span class="mono">${esc(p.voucher_code)}</span><br>
+        制备员地址：<span class="mono small">${esc(url)}</span>
+        <button class="ghost" style="margin:8px 8px 0"
+          onclick="navigator.clipboard&&navigator.clipboard.writeText('${esc(url)}')">
+          复制制备员地址</button>
+      </div>
+      <button class="danger" data-prep-revoke="1">撤销当前凭证</button>`
+    : `
+      <div class="callout warn">
+        ${p.voucher_code
+          ? `凭证已撤销（旧凭证始终失效）：<span class="mono small">${esc(p.voucher_code)}</span>，可重新签发。`
+          : '尚未签发制备凭证。'}
+      </div>
+      <button id="prepIssueBtn">签发制备凭证</button>`}
+    <div id="prepMsg"></div>
+    <p class="hint">发放进度（不泄露杯贴码与映射）：</p>
+    <table>
+      <thead><tr><th>评员</th><th>实体样品发放</th><th>时间</th></tr></thead>
+      <tbody>
+        ${(t.delivery || []).map(d => `
+          <tr>
+            <td>${esc(d.panelist)}</td>
+            <td>${d.dispensed ? '<span class="badge ok">已发放</span>'
+              : '<span class="badge wait">未发放</span>'}</td>
+            <td>${d.dispensed_at ? fmtTime(d.dispensed_at) : '—'}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function issuePrep() {
+  const msgEl = document.getElementById('prepMsg');
+  const btn = document.getElementById('prepIssueBtn');
+  btn.disabled = true; btn.textContent = '签发中…';
+  try {
+    const r = await api(`/api/tests/${encodeURIComponent(code)}/prep-voucher`, {
+      method: 'POST', body: { token },
+    });
+    showInfo(msgEl,
+      `已签发制备凭证（仅本次展示）：${r.voucher}。制备员地址 ${location.origin}${r.prep_url}`,
+      'ok');
+    load();
+  } catch (err) {
+    showErr(msgEl, err.message);
+    btn.disabled = false; btn.textContent = '签发制备凭证';
+  }
+}
+
+async function revokePrep(btn) {
+  if (!confirm('确认撤销当前制备凭证？\n\n撤销后制备员立即无法查看清单或确认发放，'
+      + '旧凭证始终失效；已发放记录保留。')) return;
+  btn.disabled = true;
+  try {
+    await api(`/api/tests/${encodeURIComponent(code)}/prep-voucher/revoke`, {
+      method: 'POST', body: { token },
+    });
+    load();
+  } catch (err) {
+    showErr(document.getElementById('prepMsg'), err.message);
+    btn.disabled = false;
+  }
 }
 
 function renderShares(shares) {
@@ -356,7 +453,7 @@ function renderReport(r) {
     <table>
       <thead><tr>
         <th>评员</th><th>盲评码</th><th>异样杯位置</th><th>异样杯样本</th>
-        <th>提交答案</th><th>判定</th>
+        <th>提交答案</th><th>判定</th><th>实体样品</th>
       </tr></thead>
       <tbody>
         ${r.assignments.map(a => `
@@ -371,6 +468,9 @@ function renderReport(r) {
             <td>${a.correct === null ? '—'
                 : a.correct ? '<span class="badge ok">答对</span>'
                 : '<span class="badge no">答错</span>'}</td>
+            <td>${a.dispensed
+                ? `<span class="badge ok">已发放</span>`
+                : '<span class="badge wait">未发放</span>'}</td>
           </tr>`).join('')}
       </tbody>
     </table>`;

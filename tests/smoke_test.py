@@ -193,6 +193,22 @@ try:
     # 旧接口行为兼容：进度、结算冻结结果照常
     s, lprog = req("GET", f"/api/tests/{legacy_code}?token={legacy_token}")
     check("旧库：进度接口兼容", s == 200 and lprog["settled"] is True)
+    # 旧库：杯贴码迁移补齐（不改动既有分配）
+    lcon2 = sqlite3.connect(db_path)
+    lcon2.row_factory = sqlite3.Row
+    legacy_aid = lcon2.execute(
+        "SELECT id FROM assignments WHERE code=?", ("LEGACYCODE1",)
+    ).fetchone()["id"]
+    legacy_stickers = lcon2.execute(
+        "SELECT pos, sticker_code FROM cup_stickers WHERE assignment_id=? "
+        "ORDER BY pos", (legacy_aid,)
+    ).fetchall()
+    check("旧库：迁移为既有分配补齐 3 枚杯贴码",
+          [r["pos"] for r in legacy_stickers] == [1, 2, 3]
+          and len({r["sticker_code"] for r in legacy_stickers}) == 3)
+    lcols = {r["name"] for r in lcon2.execute("PRAGMA table_info(assignments)")}
+    check("旧库：迁移补 dispensed_at 列", "dispensed_at" in lcols)
+    lcon2.close()
     s, lset = req("POST", f"/api/tests/{legacy_code}/settle",
                   {"token": legacy_token})
     check("旧库：重复结算仍返回冻结结果", s == 200 and lset["valid_count"] == 1)
@@ -1338,8 +1354,246 @@ try:
     check("配对对照：样本编号集合不一致被拒 (409)",
           st == 409 and "样本" in mm["detail"], str(mm))
 
-    # --- 2.6 页面可达性 ---
-    for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):
+    # --- 2.7 单场制备凭证、杯贴码与整组发放确认 ---
+    s, pv = req("POST", "/api/tests", {
+        "sample_a": "PREP-A", "sample_b": "PREP-B",
+        "panelists": ["制备张", "制备李", "制备王", "制备赵"],
+        "deadline": t["now"] + 3600_000, "min_valid": 2})
+    check("创建制备流程测试（4 人）", s == 200, str(pv))
+    pc, ptk = pv["test_code"], pv["token"]
+
+    def issue_voucher(tok=ptk):
+        return req("POST", f"/api/tests/{pc}/prep-voucher", {"token": tok})
+
+    def revoke_voucher(tok=ptk):
+        return req("POST", f"/api/tests/{pc}/prep-voucher/revoke", {"token": tok})
+
+    # 无凭证 / 凭证无效
+    s, _ = req("GET", "/api/prep/NOPE-NOTHING")
+    check("制备：无效凭证读取 404", s == 404)
+    s, _ = req("POST", "/api/tests/{}/prep-voucher".format(pc), {"token": "wrong"})
+    check("制备：令牌错误签发 403", s == 403)
+
+    # 签发
+    s, iv = issue_voucher()
+    check("制备：签发凭证 200", s == 200 and iv["active"] is True and iv["voucher"],
+          str(iv))
+    voucher = iv["voucher"]
+    s, dup = issue_voucher()
+    check("制备：同一时刻仅一份有效（重复签发 409）",
+          s == 409 and "仅一份" in dup["detail"], str(dup))
+
+    # 制备清单：每人三杯真实样本 + 唯一杯贴码；映射与库内分配一致
+    s, pl = req("GET", f"/api/prep/{voucher}")
+    check("制备：清单 200 且含 4 名当前有效评员",
+          s == 200 and len(pl["panelists"]) == 4 and pl["closed"] is False, str(pl)[:200])
+    pcon = sqlite3.connect(db_path)
+    pcon.row_factory = sqlite3.Row
+    ptid = pcon.execute("SELECT id FROM tests WHERE code=?", (pc,)).fetchone()["id"]
+    passignment = {
+        r["panelist"]: r for r in pcon.execute(
+            "SELECT * FROM assignments WHERE test_id=? AND status='active'", (ptid,))
+    }
+    map_ok = True
+    all_stickers = set()
+    for p in pl["panelists"]:
+        a = passignment[p["panelist"]]
+        if len(p["cups"]) != 3:
+            map_ok = False
+        for c in p["cups"]:
+            pos = c["pos"]
+            # 真实样本：异样杯 odd_sample(A/B)，另两杯为另一同型样本
+            expect_which = a["odd_sample"] if pos == a["odd_pos"] else (
+                "B" if a["odd_sample"] == "A" else "A")
+            expect_label = "PREP-A" if expect_which == "A" else "PREP-B"
+            if c["sample"] != expect_label:
+                map_ok = False
+            db_st = pcon.execute(
+                "SELECT sticker_code FROM cup_stickers WHERE assignment_id=? AND pos=?",
+                (a["id"], pos)).fetchone()["sticker_code"]
+            if c["sticker"] != db_st:
+                map_ok = False
+            all_stickers.add(c["sticker"])
+    check("制备：清单杯位 1～3 真实样本与库内 odd 映射一致", map_ok)
+    check("制备：4 人 × 3 = 12 枚杯贴码全局唯一、且不含样本字样",
+          len(all_stickers) == 12
+          and all("PREP-A" not in x and "PREP-B" not in x for x in all_stickers),
+          str(len(all_stickers)))
+
+    # 整组发放：首次 ok，重复 reused 返回原记录，并发只形成一条
+    s, d1 = req("POST", f"/api/prep/{voucher}/dispense", {"panelist": "制备张"})
+    check("制备：整组确认发放 200 ok=true",
+          s == 200 and d1["ok"] is True and d1["reused"] is False and d1["dispensed_at"])
+    first_ts = d1["dispensed_at"]
+    s, d1b = req("POST", f"/api/prep/{voucher}/dispense",
+                 {"panelist": " 制备张 "})
+    check("制备：重复确认返回原记录 reused=true、时间不变",
+          s == 200 and d1b["reused"] is True and d1b["dispensed_at"] == first_ts)
+    s, dn = req("POST", f"/api/prep/{voucher}/dispense", {"panelist": "不存在的人"})
+    check("制备：非当前有效评员 404", s == 404)
+
+    concurrent = []
+
+    def _concurrent_dispense():
+        st, body = req("POST", f"/api/prep/{voucher}/dispense",
+                       {"panelist": "制备李"})
+        with __import__("threading").Lock():
+            concurrent.append((st, body))
+
+    threads = [threading.Thread(target=_concurrent_dispense) for _ in range(6)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    firsts = [b for _, b in concurrent if b.get("reused") is False]
+    check("制备：6 个并发确认只形成一条记录（仅 1 个 reused=false）",
+          len(concurrent) == 6 and len(firsts) == 1
+          and all(stt == 200 for stt, _ in concurrent), str(concurrent))
+    li_dispensed = pcon.execute(
+        "SELECT COUNT(*) c, dispensed_at FROM assignments WHERE test_id=? "
+        "AND panelist='制备李' AND dispensed_at IS NOT NULL", (ptid,)).fetchone()
+    li_events = pcon.execute(
+        "SELECT COUNT(*) c FROM events e WHERE e.test_id=? AND e.type='dispense' "
+        "AND json_extract(e.payload,'$.panelist')='制备李'", (ptid,)).fetchone()["c"]
+    check("制备：并发后库内仅一条发放时间、一条 dispense 事件",
+          li_dispensed["c"] == 1 and li_events == 1)
+
+    # 已发放不可撤回（名单调整被拒）
+    zhang_code = passignment["制备张"]["code"]
+    s, wd = req("POST", f"/api/tests/{pc}/adjust",
+                {"token": ptk, "withdraw_codes": [zhang_code]})
+    check("制备：已发放评员撤回被拒 409", s == 409 and "已发放" in wd["detail"],
+          str(wd))
+
+    # 未发放撤回 → 杯贴码失效；补位者取得新杯贴码，既有分配不变
+    wang = passignment["制备王"]
+    before_li_map = (passignment["制备李"]["odd_pos"],
+                     passignment["制备李"]["odd_sample"])
+    s, adj = req("POST", f"/api/tests/{pc}/adjust",
+                 {"token": ptk,
+                  "withdraw_codes": [wang["code"]],
+                  "add_panelists": ["制备补"]})
+    check("制备：撤回未发放评员并补位 200", s == 200, str(adj))
+    old_wang_stickers = pcon.execute(
+        "SELECT COUNT(*) c FROM cup_stickers WHERE assignment_id=?",
+        (wang["id"],)).fetchone()["c"]
+    check("制备：撤回后旧杯贴码立即失效（删除 0 枚）", old_wang_stickers == 0)
+    bu = pcon.execute(
+        "SELECT * FROM assignments WHERE test_id=? AND panelist='制备补'",
+        (ptid,)).fetchone()
+    bu_stickers = pcon.execute(
+        "SELECT COUNT(*) c FROM cup_stickers WHERE assignment_id=?",
+        (bu["id"],)).fetchone()["c"]
+    bu_codes = [r["sticker_code"] for r in pcon.execute(
+        "SELECT sticker_code FROM cup_stickers WHERE assignment_id=?", (bu["id"],))]
+    check("制备：补位者取得 3 枚全新杯贴码且不与任何现存旧码重复",
+          bu_stickers == 3 and len(set(bu_codes) & all_stickers) == 0)
+    li_after = pcon.execute(
+        "SELECT odd_pos, odd_sample FROM assignments WHERE test_id=? "
+        "AND panelist='制备李'", (ptid,)).fetchone()
+    check("制备：补位不改变既有评员分配",
+          (li_after["odd_pos"], li_after["odd_sample"]) == before_li_map)
+    # 补位者出现在清单中、被撤回者消失
+    s, pl2 = req("GET", f"/api/prep/{voucher}")
+    pl_names = [p["panelist"] for p in pl2["panelists"]]
+    check("制备：清单反映当前有效评员（补位在、撤回消失）",
+          "制备补" in pl_names and "制备王" not in pl_names, str(pl_names))
+
+    # 管理台进度：只给聚合发放进度，不含杯贴码与映射
+    s, prog = req("GET", f"/api/tests/{pc}?token={ptk}")
+    prog_blob = json.dumps(prog, ensure_ascii=False)
+    check("制备：管理台发放进度 dispensed=2 / undispensed=2",
+          s == 200 and prog["preparation"]["dispensed"] == 2
+          and prog["preparation"]["undispensed"] == 2
+          and prog["preparation"]["voucher_active"] is True, str(prog["preparation"]))
+    check("制备：管理台进度不泄露杯贴码 / odd 映射 / 杯位",
+          "sticker" not in prog_blob and "odd_pos" not in prog_blob
+          and "cups" not in prog_blob and '"sample"' not in prog_blob)
+
+    # 评员页不含杯贴码
+    s, pev = req("GET", f"/api/eval/{passignment['制备赵']['code']}")
+    pev_blob = json.dumps(pev, ensure_ascii=False)
+    check("制备：评员页无杯贴码 / 映射（结算前盲态）",
+          s == 200 and "sticker" not in pev_blob
+          and "odd_pos" not in pev and "odd_sample" not in pev)
+
+    # 撤销凭证：立即拒绝读取与确认；可重签，旧凭证始终失效
+    s, rv = revoke_voucher()
+    check("制备：撤销凭证 200 active=false",
+          s == 200 and rv["active"] is False, str(rv))
+    s, rv2 = revoke_voucher()
+    check("制备：重复撤销 409", s == 409)
+    s, _ = req("GET", f"/api/prep/{voucher}")
+    check("制备：撤销后立即拒绝读取 403", s == 403)
+    s, _ = req("POST", f"/api/prep/{voucher}/dispense", {"panelist": "制备赵"})
+    check("制备：撤销后立即拒绝确认 403", s == 403)
+    s, iv2 = issue_voucher()
+    check("制备：撤销后可重签新凭证",
+          s == 200 and iv2["active"] is True and iv2["voucher"] != voucher, str(iv2))
+    voucher2 = iv2["voucher"]
+    s, pl3 = req("GET", f"/api/prep/{voucher2}")
+    check("制备：新凭证可读，旧凭证仍失效",
+          s == 200 and len(pl3["panelists"]) == 4)
+    s, _ = req("GET", f"/api/prep/{voucher}")
+    check("制备：旧凭证重签后仍 403", s == 403)
+
+    # 提前结束：禁止新发放，清单仍可读；结算保留发放记录
+    s, _ = req("POST", f"/api/tests/{pc}/end",
+               {"token": ptk, "reason": "制备流程提前结束"})
+    check("制备：提前结束 200", s == 200)
+    s, pl4 = req("GET", f"/api/prep/{voucher2}")
+    check("制备：结束后清单仍可读、closed=true",
+          s == 200 and pl4["closed"] is True and pl4["ended"] is True)
+    s, cd = req("POST", f"/api/prep/{voucher2}/dispense",
+                {"panelist": "制备赵"})
+    check("制备：结束后禁止新发放 403", s == 403 and "禁止新发放" in cd["detail"],
+          str(cd))
+    s, stl = req("POST", f"/api/tests/{pc}/settle", {"token": ptk})
+    check("制备：结算成功且保留发放记录 dispensed_count=2",
+          s == 200 and stl["dispensed_count"] == 2, str(stl.get("dispensed_count")))
+    dispensed_in_settle = {
+        a["panelist"]: a["dispensed"] for a in stl["assignments"]}
+    check("制备：结算明细逐人保留发放标记",
+          dispensed_in_settle.get("制备张") is True
+          and dispensed_in_settle.get("制备李") is True
+          and dispensed_in_settle.get("制备赵") is False)
+
+    # 时间线：prep_voucher_issue / dispense / prep_voucher_revoke 顺序入线，不含杯贴明文
+    s, tl = req("GET", f"/api/tests/{pc}/timeline?token={ptk}")
+    tl_types = [e["type"] for e in tl["events"]]
+    check("制备：时间线含签发/发放/撤销事件",
+          "prep_voucher_issue" in tl_types and "dispense" in tl_types
+          and "prep_voucher_revoke" in tl_types, str(tl_types))
+    tl_blob = json.dumps(tl, ensure_ascii=False)
+    check("制备：时间线不含完整凭证/杯贴码明文",
+          voucher not in tl_blob and voucher2 not in tl_blob
+          and all(x not in tl_blob for x in all_stickers))
+
+    # 自然截止（未提前结束）也禁止发放：独立短截止测试
+    s, nowj = req("GET", "/api/time")
+    s, dl = req("POST", "/api/tests", {
+        "sample_a": "DL-A", "sample_b": "DL-B",
+        "panelists": ["截止人"],
+        "deadline": nowj["now"] + 3000, "min_valid": 1})
+    check("制备：创建短截止测试", s == 200, str(dl))
+    s, dv = req("POST", f"/api/tests/{dl['test_code']}/prep-voucher",
+                {"token": dl["token"]})
+    check("制备：短截止测试签发凭证 200", s == 200, str(dv))
+    dvoucher = dv["voucher"]
+    time.sleep(3.5)
+    s, dpl = req("GET", f"/api/prep/{dvoucher}")
+    check("制备：过截止后清单仍可读 closed=true",
+          s == 200 and dpl["closed"] is True and dpl["ended"] is False)
+    s, dcd = req("POST", f"/api/prep/{dvoucher}/dispense",
+                 {"panelist": "截止人"})
+    check("制备：自然截止后禁止新发放 403",
+          s == 403 and "截止" in dcd["detail"], str(dcd))
+
+    pcon.close()
+
+    # --- 2.8 页面可达性 ---
+    for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}",
+                 "/prep", f"/prep/voucher/{voucher2}"):
         with urllib.request.urlopen(base + path, timeout=5) as r:
             check(f"页面 {path} → 200", r.status == 200 and b"<!DOCTYPE html>" in r.read(100))
 

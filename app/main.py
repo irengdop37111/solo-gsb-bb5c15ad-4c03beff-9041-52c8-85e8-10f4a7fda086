@@ -31,6 +31,8 @@ STATIC_DIR = "static"
 ABSTAIN = -1
 ACTIVE = "active"
 WITHDRAWN = "withdrawn"
+PREP_ACTIVE = "active"      # 制备凭证有效
+PREP_REVOKED = "revoked"    # 制备凭证已撤销
 MAX_PANELISTS = 500
 MAX_END_REASON_LEN = 200  # 负责人提前结束收集的原因长度：1～200 字
 MAX_SHARE_TTL_SECONDS = 7 * 24 * 3600  # 脱敏结果分享凭证最长有效期：7 天
@@ -49,6 +51,41 @@ def new_code(n: int = 10) -> str:
     # 去除易混字符的 URL 安全随机码
     alphabet = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
     return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def insert_cup_stickers(conn, assignment_id: int) -> dict:
+    """为一名评员的杯位 1～3 各生成一枚全局唯一、不含样本信息的杯贴码。
+
+    在调用方的写事务内执行，返回 {pos: sticker_code}。
+    """
+    stickers = {}
+    for pos in (1, 2, 3):
+        while True:  # 全局 UNIQUE(sticker_code)，撞码（极小概率）则重取
+            code = new_code(8)
+            if conn.execute(
+                "SELECT 1 FROM cup_stickers WHERE sticker_code = ?", (code,)
+            ).fetchone() is None:
+                break
+        conn.execute(
+            "INSERT INTO cup_stickers (assignment_id, pos, sticker_code) "
+            "VALUES (?, ?, ?)",
+            (assignment_id, pos, code),
+        )
+        stickers[pos] = code
+    return stickers
+
+
+def cup_samples(a) -> dict:
+    """杯位 1～3 的真实样本编号：异样杯为 odd_sample，其余两杯为另一同型样本。"""
+    other = "B" if a["odd_sample"] == "A" else "A"
+    return {
+        pos: (a["odd_sample"] if pos == a["odd_pos"] else other)
+        for pos in (1, 2, 3)
+    }
+
+
+def sample_label(test, which: str) -> str:
+    return test["sample_a"] if which == "A" else test["sample_b"]
 
 
 def hash_token(test_code: str, token: str) -> str:
@@ -123,7 +160,7 @@ def assignment_public(a) -> dict:
 
 
 def assignment_detail(a) -> dict:
-    """负责人回看：含分配与答卷。"""
+    """负责人回看：含分配、答卷与实体样品发放记录。"""
     return {
         "panelist": a["panelist"],
         "code": a["code"],
@@ -137,6 +174,10 @@ def assignment_detail(a) -> dict:
             else a["answer"] == a["odd_pos"]
         ),
         "answered_at": a["answered_at"],
+        "dispensed": a["dispensed_at"] is not None,
+        "dispensed_at": (
+            None if a["dispensed_at"] is None else a["dispensed_at"] * 1000
+        ),
     }
 
 
@@ -322,6 +363,16 @@ class CompareTests(BaseModel):
     second_token: str = Field(min_length=1)
 
 
+class PrepIssue(BaseModel):
+    """负责人签发 / 撤销单场制备凭证（凭管理令牌）。"""
+    token: str
+
+
+class PrepDispense(BaseModel):
+    """制备员按评员整组三杯确认发放（凭当前有效制备凭证）。"""
+    panelist: str = Field(min_length=1, description="评员姓名（整组三杯一次性发放）")
+
+
 # ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
@@ -332,7 +383,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="三角嗅辨盲评工作台", version="1.5", lifespan=lifespan)
+app = FastAPI(title="三角嗅辨盲评工作台", version="1.6", lifespan=lifespan)
 
 
 @app.exception_handler(HTTPException)
@@ -389,12 +440,14 @@ def create_test(body: TestCreate):
         initial = []
         for name, (odd_pos, odd_sample) in zip(names, assign_cups(len(names))):
             pcode = new_code(10)
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO assignments
                    (test_id, panelist, code, odd_pos, odd_sample)
                    VALUES (?, ?, ?, ?, ?)""",
                 (test_id, name, pcode, odd_pos, odd_sample),
             )
+            # 杯贴码与分配、创建事件同事务；制备员凭制备凭证才可查看
+            insert_cup_stickers(conn, cur.lastrowid)
             initial.append({"panelist": name, "code": pcode})
         # 创建事件与测试、名单同一事务提交
         db.log_event(conn, test_id, ts, "create", {
@@ -419,7 +472,8 @@ def get_test(test_code: str, token: str):
     conn = db.read_conn()
     try:
         assigns = conn.execute(
-            "SELECT panelist, code, answer, answered_at FROM assignments "
+            "SELECT panelist, code, answer, answered_at, dispensed_at "
+            "FROM assignments "
             "WHERE test_id = ? AND status = ? ORDER BY id",
             (row["id"], ACTIVE),
         ).fetchall()
@@ -432,6 +486,11 @@ def get_test(test_code: str, token: str):
             "SELECT * FROM shares WHERE test_id = ? ORDER BY id",
             (row["id"],),
         ).fetchall()
+        voucher = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE test_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
     finally:
         conn.close()
 
@@ -439,6 +498,8 @@ def get_test(test_code: str, token: str):
     submitted = sum(1 for a in assigns if a["answer"] is not None)
     abstained = sum(1 for a in assigns if a["answer"] == ABSTAIN)
     valid = sum(1 for a in assigns if a["answer"] not in (None, ABSTAIN))
+    dispensed = sum(1 for a in assigns if a["dispensed_at"] is not None)
+    preparation_closed = ts >= row["deadline"] or row["ended_at"] is not None
 
     return {
         "test_code": row["code"],
@@ -456,6 +517,7 @@ def get_test(test_code: str, token: str):
         "codes": [  # 仅负责人可见，用于向评员分发专属盲评链接
             {"panelist": a["panelist"],
              "code": a["code"],
+             "dispensed": a["dispensed_at"] is not None,
              "url": f"/eval/code/{a['code']}"}
             for a in assigns
         ],
@@ -465,6 +527,34 @@ def get_test(test_code: str, token: str):
             "abstained": abstained,
             "valid": valid,
         },
+        "preparation": {
+            "dispensed": dispensed,
+            "undispensed": len(assigns) - dispensed,
+            "closed": preparation_closed,
+            # 最新制备凭证（仅此负责人视角可见；制备员凭明文凭证访问）
+            "voucher_active": voucher is not None
+                              and voucher["status"] == PREP_ACTIVE,
+            "voucher_code": None if voucher is None else voucher["voucher_code"],
+            "voucher_issued_at": (
+                None if voucher is None else voucher["issued_at"] * 1000
+            ),
+            "voucher_revoked_at": (
+                None if voucher is None or voucher["revoked_at"] is None
+                else voucher["revoked_at"] * 1000
+            ),
+        },
+        # 实体样品发放进度（仅姓名/状态/时间，绝不含杯贴码与杯位映射）
+        "delivery": [
+            {
+                "panelist": a["panelist"],
+                "dispensed": a["dispensed_at"] is not None,
+                "dispensed_at": (
+                    None if a["dispensed_at"] is None
+                    else a["dispensed_at"] * 1000
+                ),
+            }
+            for a in assigns
+        ],
         # 已生成的脱敏结果分享凭证（仅负责人可见，纯增量字段，不影响既有调用方）
         "shares": [share_admin_json(s, ts) for s in shares],
     }
@@ -629,6 +719,7 @@ def settle(test_code: str, body: AdminAction):
         "correct_count": frozen["correct_count"],
         "abstained_count": sum(1 for a in assigns if a["answer"] == ABSTAIN),
         "missing_count": sum(1 for a in assigns if a["answer"] is None),
+        "dispensed_count": sum(1 for a in assigns if a["dispensed_at"] is not None),
         "p_value": frozen["p_value"],
         "min_valid": frozen["min_valid"],
         "distinguishable": bool(frozen["distinguishable"]),
@@ -771,6 +862,12 @@ def adjust_roster(test_code: str, body: AdjustRoster):
                 raise HTTPException(
                     status_code=409, detail=f"盲评码 {code} 已撤回，不能重复撤回"
                 )
+            if a["dispensed_at"] is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"评员「{a['panelist']}」的三杯已发放实体样品，"
+                           f"不可撤回（盲评码 {code}）",
+                )
             if a["answer"] is not None:
                 kind = "已弃权" if a["answer"] == ABSTAIN else "已作答"
                 raise HTTPException(
@@ -814,8 +911,11 @@ def adjust_roster(test_code: str, body: AdjustRoster):
                        "整次操作无效",
             )
 
-        # ---- 执行撤回（旧码保留审计痕迹但立即失效） ----
+        # ---- 执行撤回（旧码与杯贴码立即失效；保留分配审计痕迹） ----
         for a in withdrawn_rows:
+            conn.execute(
+                "DELETE FROM cup_stickers WHERE assignment_id = ?", (a["id"],)
+            )
             conn.execute(
                 "UPDATE assignments SET status = ? WHERE id = ?",
                 (WITHDRAWN, a["id"]),
@@ -842,12 +942,14 @@ def adjust_roster(test_code: str, body: AdjustRoster):
                         "SELECT 1 FROM assignments WHERE code = ?", (pcode,)
                     ).fetchone() is None:
                         break
-                conn.execute(
+                cur = conn.execute(
                     """INSERT INTO assignments
                        (test_id, panelist, code, odd_pos, odd_sample, status)
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (row["id"], name, pcode, odd_pos, odd_sample, ACTIVE),
                 )
+                # 补位者取得全新杯贴码；既有评员的分配与杯贴码完全不变
+                insert_cup_stickers(conn, cur.lastrowid)
                 added.append({
                     "panelist": name,
                     "code": pcode,
@@ -1237,6 +1339,277 @@ def compare_tests(body: CompareTests):
 
 
 # ---------------------------------------------------------------------------
+# 单场制备凭证：签发 / 撤销（负责人），制备清单与整组发放确认（制备员）
+# ---------------------------------------------------------------------------
+
+def prep_voucher_json(v, test_code: str) -> dict:
+    revoked = v["status"] != PREP_ACTIVE or v["revoked_at"] is not None
+    return {
+        "test_code": test_code,
+        "voucher": v["voucher_code"],
+        "prep_url": f"/prep/voucher/{v['voucher_code']}",
+        "issued_at": v["issued_at"] * 1000,
+        "revoked_at": None if v["revoked_at"] is None else v["revoked_at"] * 1000,
+        "active": not revoked,
+    }
+
+
+@app.post("/api/tests/{test_code}/prep-voucher")
+def issue_prep_voucher(test_code: str, body: PrepIssue):
+    """负责人凭管理令牌签发单场制备凭证。
+
+    - 同一时刻仅一份有效凭证：已有有效凭证时返回 409，须先撤销再重签；
+      撤销后重签会得到全新凭证，旧凭证始终失效（读取/确认一律拒绝）。
+    - 签发以 prep_voucher_issue 事件写入操作时间线（只记凭证前 4 位提示）。
+    """
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        latest = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE test_id = ? ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if latest is not None and latest["status"] == PREP_ACTIVE:
+            raise HTTPException(
+                status_code=409,
+                detail="已存在有效制备凭证；同一时刻仅一份有效，请先撤销后再重签",
+            )
+
+        ts = now_ts()
+        while True:  # 全局 UNIQUE(voucher_code)，撞码（极小概率）则重取
+            voucher_code = new_code(16)
+            if conn.execute(
+                "SELECT 1 FROM prep_vouchers WHERE voucher_code = ?",
+                (voucher_code,),
+            ).fetchone() is None:
+                break
+        conn.execute(
+            """INSERT INTO prep_vouchers
+               (test_id, voucher_code, issued_at, revoked_at, status)
+               VALUES (?, ?, ?, NULL, ?)""",
+            (row["id"], voucher_code, ts, PREP_ACTIVE),
+        )
+        v = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE voucher_code = ?", (voucher_code,)
+        ).fetchone()
+        # 审计事件不含凭证明文，只留前 4 位提示
+        db.log_event(conn, row["id"], ts, "prep_voucher_issue", {
+            "code_hint": voucher_code[:4],
+            "reissued": latest is not None,  # 是否为撤销后的重新签发
+        })
+
+    out = prep_voucher_json(v, row["code"])
+    out["ok"] = True
+    out["reused"] = False
+    return out
+
+
+@app.post("/api/tests/{test_code}/prep-voucher/revoke")
+def revoke_prep_voucher(test_code: str, body: PrepIssue):
+    """负责人撤销当前制备凭证；撤销后立即拒绝制备端读取与确认。
+
+    无凭证可撤销 → 404；已撤销 → 409（旧凭证始终失效）。
+    撤销以 prep_voucher_revoke 事件写入操作时间线。
+    """
+    with db.write_tx() as conn:
+        row = conn.execute(
+            "SELECT * FROM tests WHERE code = ?", (test_code,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="测试不存在")
+        verify_admin(row, body.token)
+
+        v = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE test_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if v is None:
+            raise HTTPException(status_code=404, detail="该实验尚未签发制备凭证")
+        if v["status"] != PREP_ACTIVE:
+            raise HTTPException(status_code=409, detail="制备凭证已撤销，不能重复撤销")
+
+        ts = now_ts()
+        conn.execute(
+            "UPDATE prep_vouchers SET revoked_at = ?, status = ? WHERE id = ?",
+            (ts, PREP_REVOKED, v["id"]),
+        )
+        db.log_event(conn, row["id"], ts, "prep_voucher_revoke", {
+            "code_hint": v["voucher_code"][:4],
+            "issued_at": v["issued_at"] * 1000,
+        })
+        v = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE id = ?", (v["id"],)
+        ).fetchone()
+
+    out = prep_voucher_json(v, row["code"])
+    out["ok"] = True
+    return out
+
+
+def _load_prep_list(conn, test) -> list:
+    """组装当前有效评员的制备清单（杯位 1～3 真实样本 + 唯一杯贴码）。"""
+    assigns = conn.execute(
+        "SELECT * FROM assignments WHERE test_id = ? AND status = ? ORDER BY id",
+        (test["id"], ACTIVE),
+    ).fetchall()
+    panelists = []
+    for a in assigns:
+        stickers = {
+            r["pos"]: r["sticker_code"]
+            for r in conn.execute(
+                "SELECT pos, sticker_code FROM cup_stickers "
+                "WHERE assignment_id = ? ORDER BY pos",
+                (a["id"],),
+            )
+        }
+        samples = cup_samples(a)
+        panelists.append({
+            "panelist": a["panelist"],
+            "dispensed": a["dispensed_at"] is not None,
+            "dispensed_at": (
+                None if a["dispensed_at"] is None else a["dispensed_at"] * 1000
+            ),
+            "cups": [
+                {
+                    "pos": pos,
+                    "sample": sample_label(test, samples[pos]),  # 真实样本编号
+                    "sticker": stickers.get(pos),                 # 不含样本信息的杯贴码
+                }
+                for pos in (1, 2, 3)
+            ],
+        })
+    return panelists
+
+
+@app.get("/api/prep/{voucher_code}")
+def get_prep_list(voucher_code: str):
+    """制备员凭有效凭证查看当前有效评员的制备清单。
+
+    - 凭证不存在 → 404；已撤销（旧凭证）→ 403，一律拒绝读取。
+    - 每人给出杯位 1～3 的真实样本编号与各杯唯一杯贴码（杯贴码本身不含样本信息）。
+    - 截止 / 提前结束后 closed=true：清单仍可读（用于对账与结算留存），但禁止新发放。
+    - 评员页与结算前进度不经由本接口，本接口只有持有效凭证的制备员可访问。
+    """
+    conn = db.read_conn()
+    try:
+        v = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE voucher_code = ?",
+            (voucher_code,),
+        ).fetchone()
+        if v is None:
+            raise HTTPException(status_code=404, detail="制备凭证无效")
+        if v["status"] != PREP_ACTIVE:
+            raise HTTPException(status_code=403,
+                                detail="制备凭证已撤销，旧凭证始终失效")
+        test = conn.execute(
+            "SELECT * FROM tests WHERE id = ?", (v["test_id"],)
+        ).fetchone()
+        if test is None:
+            raise HTTPException(status_code=404, detail="制备凭证无效")
+        panelists = _load_prep_list(conn, test)
+    finally:
+        conn.close()
+
+    ts = now_ts()
+    closed = test["ended_at"] is not None or ts >= test["deadline"]
+    return {
+        "test_code": test["code"],
+        "sample_a": test["sample_a"],
+        "sample_b": test["sample_b"],
+        "deadline": test["deadline"] * 1000,
+        "now": ts * 1000,
+        "ended": test["ended_at"] is not None,
+        "ended_at": None if test["ended_at"] is None else test["ended_at"] * 1000,
+        "end_reason": test["end_reason"] if test["ended_at"] is not None else None,
+        "closed": closed,
+        "settled": test["settled_at"] is not None,
+        "panelists": panelists,
+    }
+
+
+@app.post("/api/prep/{voucher_code}/dispense")
+def confirm_dispense(voucher_code: str, body: PrepDispense):
+    """制备员按评员整组三杯确认发放。
+
+    - 凭当前有效凭证；凭证无效 404、已撤销 403（撤销后立即拒绝确认）。
+    - 截止或提前结束后禁止新发放（403）；结算不删除已发放记录。
+    - 整组三杯一次性确认：按评员姓名定位当前有效评员；已发放评员重复确认
+      返回原记录（reused=true），并发确认在 BEGIN IMMEDIATE 下只形成一条记录。
+    - 已发放评员不可撤回（名单调整接口据此 409）；发放以 dispense 事件入时间线。
+    """
+    panelist = body.panelist.strip()
+    if not panelist:
+        raise HTTPException(status_code=422, detail="评员姓名不能为空")
+
+    with db.write_tx() as conn:
+        ts = now_ts()
+        v = conn.execute(
+            "SELECT * FROM prep_vouchers WHERE voucher_code = ?",
+            (voucher_code,),
+        ).fetchone()
+        if v is None:
+            raise HTTPException(status_code=404, detail="制备凭证无效")
+        if v["status"] != PREP_ACTIVE:
+            raise HTTPException(status_code=403,
+                                detail="制备凭证已撤销，确认发放被拒绝")
+
+        test = conn.execute(
+            "SELECT * FROM tests WHERE id = ?", (v["test_id"],)
+        ).fetchone()
+        if test is None:
+            raise HTTPException(status_code=404, detail="制备凭证无效")
+        if test["ended_at"] is not None:
+            raise HTTPException(
+                status_code=403,
+                detail="收集已被负责人提前结束，禁止新发放",
+            )
+        if ts >= test["deadline"]:
+            raise HTTPException(status_code=403,
+                                detail="已过截止时间，禁止新发放")
+
+        a = conn.execute(
+            "SELECT * FROM assignments WHERE test_id = ? AND panelist = ? "
+            "AND status = ?",
+            (test["id"], panelist, ACTIVE),
+        ).fetchone()
+        if a is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"当前有效名单中没有评员：{panelist}（可能已撤回或姓名不符）",
+            )
+
+        reused = a["dispensed_at"] is not None
+        if not reused:
+            conn.execute(
+                "UPDATE assignments SET dispensed_at = ? WHERE id = ?",
+                (ts, a["id"]),
+            )
+            # 发放事件只记评员与盲评码，不含杯位映射
+            db.log_event(conn, test["id"], ts, "dispense", {
+                "panelist": a["panelist"],
+                "code": a["code"],
+            })
+            dispensed_at = ts
+        else:
+            dispensed_at = a["dispensed_at"]
+
+    return {
+        "ok": not reused,
+        "reused": reused,
+        "test_code": test["code"],
+        "panelist": a["panelist"],
+        "dispensed": True,
+        "dispensed_at": dispensed_at * 1000,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 前端
 # ---------------------------------------------------------------------------
 
@@ -1253,6 +1626,16 @@ def admin_page():
 @app.get("/eval")
 def eval_entry():
     return FileResponse(f"{STATIC_DIR}/eval.html")
+
+
+@app.get("/prep")
+def prep_entry():
+    return FileResponse(f"{STATIC_DIR}/prep.html")
+
+
+@app.get("/prep/voucher/{code}")
+def prep_by_voucher(code: str):
+    return FileResponse(f"{STATIC_DIR}/prep.html")
 
 
 @app.get("/eval/code/{code}")
