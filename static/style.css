@@ -118,3 +118,26 @@ tr.miss td { background: #fef3f2; }
 a { color: var(--brand); }
 .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 .small { font-size: 13px; }
+
+/* 制备员制备台：每位评员一个整组卡片 */
+.prep-row {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+  background: #fff;
+}
+.prep-row.done { background: #f6faf7; border-color: #abefc6; }
+.prep-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 15px;
+}
+.prep-head .prep-btn { margin: 0; padding: 6px 16px; font-size: 13.5px; }
+.prep-row table { margin-top: 4px; }
+
+/* 管理台发放进度徽标 */
+.deliv-yes { color: var(--ok); font-weight: 600; }
+.deliv-no { color: var(--muted); }

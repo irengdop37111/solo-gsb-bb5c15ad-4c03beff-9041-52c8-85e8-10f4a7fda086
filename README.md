@@ -73,6 +73,23 @@
       不一致对为 0 时 p=1，**p ≤ 0.05 才标记有差异**）；
     - 只返回汇总计数与结论，**不返回个人答案、杯序或盲评码**；接口只读，
       不改变两场实验状态，也不写入操作时间线。
+12. **实体样品制备与发放追踪（制备员）**：负责人凭管理令牌为**单场**实验签发
+    **制备凭证**，把三杯盲评分配落实到实体样品并跟踪交付：
+    - **凭证单份有效**：同一时刻同一实验**仅一份有效凭证**，已存在有效凭证再签发
+      返回 409；**撤销后可重签**，撤销立即生效，**旧凭证始终失效**（永不复用）；
+    - 制备员凭**有效凭证**查看当前有效评员的**制备清单**：每人杯位 1～3 对应的
+      **真实样本**与各杯**不含样本信息的唯一杯贴码**；评员页与结算前负责人进度
+      **都不泄露**杯位↔样本映射或杯贴码；
+    - 制备员按评员**整组三杯确认发放**；重复确认返回原记录（`reused=true`），
+      **并发确认只形成一条记录**（写锁串行 + 唯一约束兜底）；
+    - **已发放评员不得撤回**；未发放评员撤回后其杯贴码立即从清单消失（失效），
+      **补位者取得全新杯贴码**且既有评员的分配与杯贴完全不变；
+    - **截止、提前结束或结算后禁止新发放**（确认 403），但清单在截止/结束后仍可读
+      供现场核对，**结算保留全部发放记录**（结算回看每人带“已发放/时间”）；
+    - **撤销凭证后立即拒绝读取与确认**（均 403）；签发、撤销、发放以
+      `prep_issue` / `prep_revoke` / `deliver` 写入操作时间线
+      （发放事件只含评员姓名，不含杯位、样本与杯贴）；
+    - 管理台新增「实体样品制备凭证与发放进度」卡片，制备员页面位于 `/prep`。
 
 **评员**
 
@@ -98,6 +115,7 @@ docker compose up -d --build
 
 - 负责人首页（创建 / 进入结算台）：<http://localhost:8080/>
 - 评员入口：<http://localhost:8080/eval>
+- 制备员入口（凭制备凭证）：<http://localhost:8080/prep>
 
 停止与查看日志：
 
@@ -153,7 +171,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8080
 原子性/并发一致性、旧数据库升级的记录起点标记，以及脱敏结果分享凭证的生成幂等/
 内容冲突/只读脱敏白名单/到期与撤销拒绝/时间线审计/旧库兼容、复测配对对照
 （前置校验拒绝、A/B 对调接受、配对/无效/未配对计数、四格汇总、精确双侧 p 值、
-无有效配对 p 为空、响应脱敏））：
+无有效配对 p 为空、响应脱敏）、实体样品制备与发放
+（单份有效/重签/旧凭证失效、制备清单映射与杯贴唯一性、盲态不泄露、
+整组发放幂等与并发只形成一条记录、已发放不可撤回与补位新杯贴、
+截止/结束/结算禁止新发放、撤销立即拒绝读取与确认、结算保留发放记录、时间线审计））：
 
 ```bash
 pip install -r requirements.txt
@@ -174,6 +195,10 @@ python tests/smoke_test.py
 | POST | `/api/tests/{code}/shares/{share_code}/revoke` | 到期前撤销分享凭证 |
 | GET  | `/api/shares/{share_code}` | 不记名只读脱敏结果（到期 / 撤销后拒绝） |
 | POST | `/api/compare` | 复测配对对照：凭两场已结算实验的测试码 + 各自令牌，按同名评员配对做精确双侧配对二项检验 |
+| POST | `/api/tests/{code}/prep-credentials` | 负责人签发单场制备凭证（同一时刻仅一份有效，明文仅返回一次） |
+| POST | `/api/tests/{code}/prep-credentials/revoke` | 撤销制备凭证（立即生效，旧凭证始终失效；撤销后可重签） |
+| GET  | `/api/prep/{prep_code}/list` | 制备员凭有效凭证查看制备清单（杯位 1～3 真实样本 + 唯一杯贴码） |
+| POST | `/api/prep/{prep_code}/deliver` | 按评员整组三杯确认发放（重复/并发确认只形成一条记录） |
 | GET  | `/api/eval/{code}` | 评员视图（结算前无任何分配/样本信息） |
 | POST | `/api/eval/{code}/submit` | 提交 `{"answer":1|2|3}` 或 `{"abstain":true}` |
 | GET  | `/api/time` | 服务端当前时间（毫秒） |
@@ -429,6 +454,9 @@ curl "http://localhost:8080/api/tests/AbCdEf12/timeline?token=负责人令牌"
 | `settle` | 结算形成（与冻结状态同事务；重复结算不追加） | 有效 / 答对 / 弃权 / 未交数、p 值、判定；提前结束后立即结算时含 `settled_after_end=true` |
 | `share_create` | 脱敏结果分享凭证生成（重复请求不追加） | 备注、有效期、到期时间、凭证前 4 位提示（不含完整凭证） |
 | `share_revoke` | 分享凭证撤销（到期前；重复/过期撤销不追加） | 备注、有效期、生成/到期时间、凭证前 4 位提示 |
+| `prep_issue` | 制备凭证签发（同一时刻仅一份有效） | 凭证 id、凭证前 4 位提示（不含完整凭证） |
+| `prep_revoke` | 制备凭证撤销（立即生效，旧凭证始终失效） | 凭证 id、凭证前 4 位提示 |
+| `deliver` | 制备员按评员整组三杯发放成功（重复/并发确认不追加） | 评员姓名（不含杯位、真实样本与杯贴码） |
 | `history_start` | 旧库升级后的记录起点标记 | `note` 说明既往操作不可追溯、`legacy_created_at` |
 
 原子性：答卷、调整、结算的业务状态与对应事件在同一个 `BEGIN IMMEDIATE` 事务中提交，
@@ -501,11 +529,124 @@ curl -X POST http://localhost:8080/api/compare \
 - 该接口为**只读**：不改变两场实验的任何状态，也不写入操作时间线；
   响应只含汇总计数与结论，**不返回个人答案、杯序（异样杯位置/样本）或盲评码**。
 
+### 实体样品制备与发放接口调用示例
+
+负责人先凭管理凭证为**单场**实验签发给制备员的**制备凭证**（不记名能力码，
+明文仅在签发响应中给出一次，需点对点交给制备员）：
+
+```bash
+curl -X POST http://localhost:8080/api/tests/AbCdEf12/prep-credentials \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"负责人令牌"}'
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "test_code": "AbCdEf12",
+  "prep_code": "mK7wX2pQvB8nR4tY",
+  "prep_url": "/prep?prep=mK7wX2pQvB8nR4tY",
+  "list_url": "/api/prep/mK7wX2pQvB8nR4tY/list",
+  "created_at": 1759000000000,
+  "active": true
+}
+```
+
+制备员（或自动化产线）凭凭证读取**当前有效评员**的制备清单——每人杯位 1～3
+对应的**真实样本**与各杯**唯一杯贴码**（码面不含任何样本信息）：
+
+```bash
+curl "http://localhost:8080/api/prep/mK7wX2pQvB8nR4tY/list"
+```
+
+```json
+{
+  "test_code": "AbCdEf12",
+  "sample_a": "茉莉",
+  "sample_b": "玫瑰",
+  "deadline": 1759002600000,
+  "now": 1759000000000,
+  "ended": false,
+  "settled": false,
+  "delivery_open": true,
+  "progress": {"total": 9, "delivered": 0, "pending": 9},
+  "panelists": [
+    {"panelist": "张三", "delivered": false, "delivered_at": null, "cups": [
+      {"pos": 1, "sample_key": "B", "sample_name": "玫瑰", "sticker": "kPq7mWx2Za"},
+      {"pos": 2, "sample_key": "A", "sample_name": "茉莉", "sticker": "nR4tYv8QbC"},
+      {"pos": 3, "sample_key": "B", "sample_name": "玫瑰", "sticker": "A2bcDeFGhJ"}
+    ]}
+  ]
+}
+```
+
+制备员把三杯实物按 `sample_name` 备好、贴上对应 `sticker` 杯贴，整组三杯交给评员后，
+**按评员整组确认发放**：
+
+```bash
+curl -X POST http://localhost:8080/api/prep/mK7wX2pQvB8nR4tY/deliver \
+  -H 'Content-Type: application/json' \
+  -d '{"panelist":"张三"}'
+```
+
+```json
+{
+  "ok": true,
+  "reused": false,
+  "test_code": "AbCdEf12",
+  "panelist": "张三",
+  "delivered": true,
+  "delivered_at": 1759000100000,
+  "progress": {"total": 9, "delivered": 1, "pending": 8}
+}
+```
+
+负责人撤销当前制备凭证（也可在请求体带 `"prep_code":"…"` 精确撤销某一份）：
+
+```bash
+curl -X POST http://localhost:8080/api/tests/AbCdEf12/prep-credentials/revoke \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"负责人令牌"}'
+```
+
+规则与常见失败：
+
+- **单份有效**：同一时刻同一实验仅一份有效制备凭证，重复签发 **409**
+  （`同一时刻仅一份有效`）；**撤销后可重签**，新凭证是全新随机码。
+- **旧凭证始终失效**：撤销后再用旧凭证读清单或确认发放一律 **403**
+  （`制备凭证已撤销，访问被拒绝`）；未知凭证 **404**。
+- **盲态隔离**：制备映射（杯位↔真实样本）与杯贴码只对持有效凭证的制备端开放；
+  评员接口始终不含这些信息，负责人进度接口（`GET /api/tests/{code}`）只返回
+  `delivery_progress {delivered,pending,closed}` 与每人“是否已发放/时间”，
+  **不含**杯贴码、杯位或真实样本。
+- **整组发放**：确认以评员姓名为整组标识；当前有效清单中不存在（已撤回/未知）
+  的姓名 **404**。重复确认返回**原记录**（`reused=true`、`ok=false`、
+  `delivered_at` 不变）；并发确认由写锁串行、库内唯一约束兜底，
+  **同一评员只形成一条发放记录**。
+- **撤回联动**：**已发放评员不得撤回**（撤回接口 409，提示已整组发放）；
+  未发放评员撤回后其杯贴码立即从制备清单消失而失效，补位评员取得**全新三杯
+  杯贴码**，其他评员的既有分配、答卷与杯贴完全不变。
+- **截止 / 结束 / 结算**：截止或提前结束后禁止新发放（确认 **403**），
+  但制备清单仍可读（`delivery_open=false`）供现场核对；结算保留全部发放记录，
+  结算回看每人含 `delivered / delivered_at`；已结算实验不再签发凭证（409）。
+- **时间线审计**：签发 / 撤销 / 成功发放分别以 `prep_issue` / `prep_revoke`
+  / `deliver` 写入该实验操作时间线（同事务，失败不留痕）；事件只记录凭证前 4 位
+  提示与评员姓名，**不含完整凭证、杯位、真实样本或杯贴码**。
+
+管理台（`/admin`）新增「实体样品制备凭证与发放进度」卡片，可直接签发/撤销凭证、
+查看每人整组发放状态与时间；制备员操作页位于 <http://localhost:8080/prep>
+（首页也有入口），粘贴凭证后即可看清单并逐人整组确认。
+
 ## 安全与使用注意
 
 - **负责人令牌只在创建测试时返回一次**，请立即保存；它与测试码共同构成管理凭证（服务端只存 SHA-256 哈希）。
 - **脱敏结果分享凭证是不记名只读能力凭证**：持有者无需登录即可在有效期内读取脱敏结果，请通过点对点方式分发；到期或撤销前一直可读（非一次性读取，「一次性」指每次生成的随机凭证全局唯一）。凭证明文在服务端入库（与盲评码同级），管理时间线只记录其前 4 位提示，不记录完整凭证。
 - 盲评码仅用于防混淆与一次性提交，不是身份认证：分发链接时应单独、点对点发给对应评员。
+- **制备凭证是单场不记名能力凭证**：持有者可查看该场全部评员的杯位↔真实样本映射与杯贴码，
+  属敏感制备信息，须点对点发给制备员；同一时刻仅一份有效，发现泄露可立即在管理台撤销，
+  撤销后旧凭证立即失效，再重签即可。杯贴码本身不含样本信息，可随杯流转，但映射只在制备端可见。
 - 部署到不可信网络时建议置于 HTTPS 反向代理之后。
 - 应用固定单 uvicorn worker（SQLite 单库写已串行化，满足实验规模；多 worker 也可借助 WAL 工作，但无必要）。
 
@@ -513,12 +654,13 @@ curl -X POST http://localhost:8080/api/compare \
 
 ```
 app/
-  main.py        # FastAPI 路由与业务逻辑（含操作时间线、脱敏结果分享凭证接口）
-  db.py          # SQLite 连接、建表（tests/assignments/events/shares）、写事务、事件写入与旧库起点标记
+  main.py        # FastAPI 路由与业务逻辑（含操作时间线、脱敏分享凭证、制备凭证与整组发放）
+  db.py          # SQLite 连接、建表（tests/assignments/events/shares/cups/prep_credentials/deliveries）、写事务、事件写入与旧库迁移
   stats.py       # 二项分布单侧尾概率与精确双侧配对二项检验（复测对照）
 static/
   index.html     # 负责人首页：创建 / 进入
-  admin.html     # 负责人结算台：进度、分发、结算、回看、脱敏分享凭证管理
+  admin.html     # 负责人结算台：进度、制备凭证与发放进度、分发、结算、回看、脱敏分享凭证管理
+  prep.html      # 制备员制备台：制备清单（真实样本 + 杯贴码）与整组发放确认
   eval.html      # 评员盲评页：三杯选择 / 弃权 / 截止后回看
   app.js, style.css
 tests/smoke_test.py

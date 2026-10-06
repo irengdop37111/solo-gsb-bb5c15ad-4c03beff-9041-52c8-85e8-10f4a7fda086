@@ -7,11 +7,15 @@
 
 import json
 import os
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
 
 DB_PATH = os.environ.get("SNIFF_DB_PATH", "/data/sniff.db")
+
+# 杯贴码字母表：去除易混字符（与盲评码同级高熵随机），码面不含任何样本信息
+_STICKER_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tests (
@@ -36,7 +40,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,   -- 全局提交顺序（稳定排序键）
     test_id     INTEGER NOT NULL REFERENCES tests(id),
     ts          INTEGER NOT NULL,                    -- 服务端事件时间（秒，事务内采集）
-    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke
+    type        TEXT NOT NULL,   -- create/answer/adjust/end/settle/history_start/share_create/share_revoke/prep_issue/prep_revoke/deliver
     payload     TEXT NOT NULL DEFAULT '{}'           -- JSON，盲态字段读取时再裁剪
 );
 
@@ -73,6 +77,43 @@ CREATE TABLE IF NOT EXISTS shares (
 );
 
 CREATE INDEX IF NOT EXISTS idx_shares_test ON shares(test_id);
+
+-- 杯贴码：每个有效评员的 1/2/3 杯位各一枚唯一杯贴码，码本身不含任何样本信息。
+-- 评员被撤回后其杯贴码不再出现在任何制备清单中（随 assignment 状态一并失效）；
+-- 补位评员是新的 assignment，取得全新杯贴码。
+CREATE TABLE IF NOT EXISTS cups (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id  INTEGER NOT NULL REFERENCES assignments(id),
+    pos            INTEGER NOT NULL CHECK (pos IN (1, 2, 3)),  -- 杯位 1/2/3
+    sticker        TEXT NOT NULL UNIQUE,                        -- 唯一杯贴码（不含样本信息）
+    UNIQUE(assignment_id, pos)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cups_assignment ON cups(assignment_id);
+
+-- 单场制备凭证：负责人凭管理令牌签发；同一时刻同一实验仅一份有效。
+-- 部分唯一索引在库级保证「仅一份有效」；撤销（revoked_at 置位）后可重签，旧凭证始终失效。
+CREATE TABLE IF NOT EXISTS prep_credentials (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id     INTEGER NOT NULL REFERENCES tests(id),
+    prep_code   TEXT NOT NULL UNIQUE,                 -- 制备凭证（不记名能力码，发给制备员）
+    created_at  INTEGER NOT NULL,                     -- 签发时间（秒）
+    revoked_at  INTEGER                               -- 撤销时间（秒）；NULL 表示当前有效
+);
+
+CREATE INDEX IF NOT EXISTS idx_prep_test ON prep_credentials(test_id, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prep_active
+ON prep_credentials(test_id) WHERE revoked_at IS NULL;
+
+-- 整组三杯发放记录：同一评员（assignment）至多一条；
+-- 重复确认命中同一行（幂等），并发确认由唯一约束 + 写锁保证只形成一条记录。
+CREATE TABLE IF NOT EXISTS deliveries (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignment_id  INTEGER NOT NULL UNIQUE REFERENCES assignments(id),
+    credential_id  INTEGER NOT NULL REFERENCES prep_credentials(id),  -- 以哪份凭证确认发放
+    delivered_at   INTEGER NOT NULL                    -- 发放时间（秒，服务端时钟）
+);
 """
 
 
@@ -108,6 +149,46 @@ def init_db():
     # 兼容旧库：events 表上线前创建的测试没有任何操作记录。
     # 为每个这样的测试补一条明确的“记录起点”标记，不重建、不虚构既往操作。
     backfill_history_markers()
+    # 兼容旧库：本轮新增杯贴体系，为已存在但缺少杯贴的评员补发杯贴码。
+    backfill_cups()
+
+
+def new_sticker(conn) -> str:
+    """生成一枚全局唯一的杯贴码（10 位）；调用方须在写事务内。"""
+    while True:
+        code = "".join(secrets.choice(_STICKER_ALPHABET) for _ in range(10))
+        if conn.execute(
+            "SELECT 1 FROM cups WHERE sticker = ?", (code,)
+        ).fetchone() is None:
+            return code
+
+
+def add_cups(conn, assignment_id: int):
+    """为一名评员的三杯（杯位 1/2/3）各插入一枚唯一杯贴码。"""
+    for pos in (1, 2, 3):
+        conn.execute(
+            "INSERT INTO cups (assignment_id, pos, sticker) VALUES (?, ?, ?)",
+            (assignment_id, pos, new_sticker(conn)),
+        )
+
+
+def backfill_cups():
+    """为缺少杯贴记录的旧评员（含已撤回者）一次性补发，幂等可重复执行。"""
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT a.id FROM assignments a WHERE NOT EXISTS ("
+            "SELECT 1 FROM cups c WHERE c.assignment_id = a.id)"
+        ).fetchall()
+        for r in rows:
+            add_cups(conn, r["id"])
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def backfill_history_markers():

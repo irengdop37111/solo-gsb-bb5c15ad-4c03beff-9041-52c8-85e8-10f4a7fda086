@@ -1338,8 +1338,257 @@ try:
     check("配对对照：样本编号集合不一致被拒 (409)",
           st == 409 and "样本" in mm["detail"], str(mm))
 
-    # --- 2.6 页面可达性 ---
-    for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}"):
+    # --- 2.6 实体样品制备凭证与整组发放（本轮） ---
+    s, ppt = req("POST", "/api/tests", {
+        "sample_a": "茉莉", "sample_b": "玫瑰",
+        "panelists": ["甲", "乙", "丙", "丁"],
+        "deadline": t["now"] + 3600_000, "min_valid": 2})
+    check("制备：创建 4 人测试", s == 200, str(ppt))
+    prep_tc, prep_tok = ppt["test_code"], ppt["token"]
+
+    # 未签发先读取 -> 404
+    s, _ = req("GET", "/api/prep/nosuchcredential00/list")
+    check("制备：未知凭证 404", s == 404)
+
+    # 签发凭证（管理令牌）
+    s, iss = req("POST",
+                 f"/api/tests/{prep_tc}/prep-credentials", {"token": prep_tok})
+    check("制备：签发凭证 200 且含入口与清单地址",
+          s == 200 and len(iss["prep_code"]) >= 12
+          and iss["prep_url"].startswith("/prep?prep=")
+          and iss["list_url"] == f"/api/prep/{iss['prep_code']}/list", str(iss))
+    prep_code = iss["prep_code"]
+
+    # 错误管理令牌
+    s, _ = req("POST", f"/api/tests/{prep_tc}/prep-credentials",
+               {"token": "wrong"})
+    check("制备：错误管理令牌签发 403", s == 403)
+    # 同一时刻仅一份有效
+    s, dup = req("POST", f"/api/tests/{prep_tc}/prep-credentials",
+                 {"token": prep_tok})
+    check("制备：已存在有效凭证再签 409", s == 409 and "仅一份" in dup["detail"],
+          str(dup))
+
+    # 制备清单：真实样本映射、唯一杯贴码、不含评员盲评码
+    s, pl = req("GET", f"/api/prep/{prep_code}/list")
+    check("制备：清单 200、4 人、每人三杯、发放通道开启",
+          s == 200 and pl["delivery_open"] is True and len(pl["panelists"]) == 4
+          and all(len(p["cups"]) == 3 for p in pl["panelists"]), str(pl)[:200])
+    stickers = [c["sticker"] for p in pl["panelists"] for c in p["cups"]]
+    check("制备：12 枚杯贴码全部唯一", len(stickers) == 12
+          and len(set(stickers)) == 12, str(len(stickers)))
+    check("制备：杯贴码本身不含样本字样",
+          all("茉莉" not in x and "玫瑰" not in x for x in stickers))
+    # 映射与库内 odd_pos/odd_sample 一致
+    rows_by_name = {
+        r["panelist"]: r
+        for r in con.execute(
+            "SELECT panelist, odd_pos, odd_sample FROM assignments "
+            "WHERE test_id=(SELECT id FROM tests WHERE code=?)",
+            (prep_tc,)).fetchall()
+    }
+    mapping_ok = True
+    for p in pl["panelists"]:
+        rr = rows_by_name[p["panelist"]]
+        for c in p["cups"]:
+            want = rr["odd_sample"] if c["pos"] == rr["odd_pos"] else (
+                "B" if rr["odd_sample"] == "A" else "A")
+            if c["sample_key"] != want:
+                mapping_ok = False
+            if c["sample_name"] != (pl["sample_a"] if c["sample_key"] == "A"
+                                    else pl["sample_b"]):
+                mapping_ok = False
+    check("制备：清单杯位↔真实样本映射与库内分配一致", mapping_ok)
+    # 清单不泄露评员盲评码
+    admin0 = req("GET", f"/api/tests/{prep_tc}?token={prep_tok}")[1]
+    eval_code_set = {c["code"] for c in admin0["codes"]}
+    pl_blob = json.dumps(pl, ensure_ascii=False)
+    check("制备：清单不含任何评员盲评码",
+          not any(ec in pl_blob for ec in eval_code_set))
+    check("制备：清单不含 odd_pos/odd_sample 原始字段",
+          "odd_pos" not in pl_blob and "odd_sample" not in pl_blob)
+
+    # 整组发放：幂等
+    s, d1 = req("POST", f"/api/prep/{prep_code}/deliver",
+                {"panelist": "甲"})
+    check("制备：首次整组发放 ok、reused=false、计数 1",
+          s == 200 and d1["ok"] is True and d1["reused"] is False
+          and d1["progress"]["delivered"] == 1, str(d1))
+    s, d2 = req("POST", f"/api/prep/{prep_code}/deliver",
+                {"panelist": "甲"})
+    check("制备：重复确认返回原记录 reused=true、仍计数 1",
+          s == 200 and d2["reused"] is True and d2["delivered_at"] == d1["delivered_at"]
+          and d2["progress"]["delivered"] == 1, str(d2))
+
+    # 并发确认同一评员：只形成一条记录
+    barrier = threading.Barrier(4)
+    race_statuses, race_bodies = [], []
+
+    def race_deliver():
+        barrier.wait()
+        sc, bd = req("POST", f"/api/prep/{prep_code}/deliver",
+                     {"panelist": "乙"})
+        race_statuses.append(sc)
+        race_bodies.append(bd)
+
+    threads = [threading.Thread(target=race_deliver) for _ in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    n_deliver_rows = con.execute(
+        "SELECT COUNT(*) c FROM deliveries d JOIN assignments a "
+        "ON a.id=d.assignment_id WHERE a.test_id="
+        "(SELECT id FROM tests WHERE code=?) AND a.panelist='乙'",
+        (prep_tc,)).fetchone()["c"]
+    check("制备：4 并发确认同一评员全部 200 且只形成一条记录",
+          race_statuses == [200] * 4 and n_deliver_rows == 1
+          and sum(1 for b in race_bodies if b.get("reused") is False) == 1,
+          f"{race_statuses} rows={n_deliver_rows}")
+
+    # 未知/已撤回评员发放 404
+    s, nf = req("POST", f"/api/prep/{prep_code}/deliver",
+                {"panelist": "不存在的人"})
+    check("制备：清单外评员发放 404", s == 404, str(nf))
+
+    # 已发放评员不得撤回
+    jia_code = next(c["code"] for c in admin0["codes"] if c["panelist"] == "甲")
+    s, wd = req("POST", f"/api/tests/{prep_tc}/adjust",
+                {"token": prep_tok, "withdraw_codes": [jia_code],
+                 "add_panelists": []})
+    check("制备：已发放评员撤回被拒 409",
+          s == 409 and "已整组发放" in wd["detail"], str(wd))
+
+    # 未发放评员撤回：杯贴码立即从清单消失；补位者取得新杯贴码；既有分配不变
+    bing_code = next(c["code"] for c in admin0["codes"] if c["panelist"] == "丙")
+    bing_old = {c["sticker"] for p in pl["panelists"] if p["panelist"] == "丙"
+                for c in p["cups"]}
+    jia_cups = {c["sticker"] for p in pl["panelists"] if p["panelist"] == "甲"
+                for c in p["cups"]}
+    s, adjp = req("POST", f"/api/tests/{prep_tc}/adjust",
+                  {"token": prep_tok,
+                   "withdraw_codes": [bing_code],
+                   "add_panelists": ["戊"]})
+    check("制备：撤回未发放评员并补位 200", s == 200 and adjp["ok"], str(adjp))
+    s, pl2 = req("GET", f"/api/prep/{prep_code}/list")
+    names_now = {p["panelist"] for p in pl2["panelists"]}
+    stickers_now = {c["sticker"] for p in pl2["panelists"] for c in p["cups"]}
+    jia_now = {c["sticker"] for p in pl2["panelists"] if p["panelist"] == "甲"
+               for c in p["cups"]}
+    wu_cups = {c["sticker"] for p in pl2["panelists"] if p["panelist"] == "戊"
+               for c in p["cups"]}
+    check("制备：撤回者从清单消失、补位者出现", "丙" not in names_now
+          and "戊" in names_now, str(names_now))
+    check("制备：撤回者旧杯贴码全部失效（不再出现）",
+          not (bing_old & stickers_now), str(bing_old & stickers_now))
+    check("制备：补位者取得 3 枚全新杯贴码", len(wu_cups) == 3
+          and not (wu_cups & (stickers - bing_old)))
+    check("制备：既有评员（甲）杯贴码完全不变", jia_now == jia_cups)
+
+    # 负责人进度：有发放进度但不含映射/杯贴
+    s, prog = req("GET", f"/api/tests/{prep_tc}?token={prep_tok}")
+    pblob = json.dumps(prog, ensure_ascii=False)
+    check("制备：进度接口含发放计数（已发放 2：甲、乙）",
+          s == 200 and prog["delivery_progress"]["delivered"] == 2
+          and prog["delivery_progress"]["pending"] == 2, str(prog["delivery_progress"]))
+    check("制备：进度接口不泄露杯贴码与杯位/样本映射",
+          "sticker" not in pblob and "odd_pos" not in pblob
+          and "odd_sample" not in pblob
+          and not (bing_old & set(pblob.replace('"', ' ').split())))
+    check("制备：进度接口返回当前有效凭证状态",
+          prog["prep"] is not None and prog["prep"]["active"] is True)
+
+    # 提前结束后：禁止新发放；清单仍可读
+    s, _ = req("POST", f"/api/tests/{prep_tc}/end",
+               {"token": prep_tok, "reason": "制备完成，提前结束"})
+    check("制备：提前结束 200", s == 200)
+    s, pl3 = req("GET", f"/api/prep/{prep_code}/list")
+    check("制备：结束后清单仍可读、通道关闭",
+          s == 200 and pl3["delivery_open"] is False)
+    s, da = req("POST", f"/api/prep/{prep_code}/deliver", {"panelist": "丁"})
+    check("制备：结束后新发放 403", s == 403 and "禁止新发放" in da["detail"],
+          str(da))
+
+    # 撤销凭证：读取与确认立即被拒；时间线审计
+    s, rev = req("POST",
+                 f"/api/tests/{prep_tc}/prep-credentials/revoke",
+                 {"token": prep_tok})
+    check("制备：撤销凭证 200", s == 200 and rev["active"] is False, str(rev))
+    s, rl = req("GET", f"/api/prep/{prep_code}/list")
+    check("制备：撤销后读取清单 403", s == 403 and "撤销" in rl["detail"], str(rl))
+    s, rc = req("POST", f"/api/prep/{prep_code}/deliver", {"panelist": "丁"})
+    check("制备：撤销后确认发放 403", s == 403, str(rc))
+    # 重复撤销 / 指定旧凭证撤销 -> 409
+    s, rr2 = req("POST",
+                 f"/api/tests/{prep_tc}/prep-credentials/revoke",
+                 {"token": prep_tok})
+    check("制备：无有效凭证时再撤销 409", s == 409, str(rr2))
+    s, rr3 = req("POST",
+                 f"/api/tests/{prep_tc}/prep-credentials/revoke",
+                 {"token": prep_tok, "prep_code": prep_code})
+    check("制备：指定已撤销凭证撤销 409", s == 409, str(rr3))
+    s, rr4 = req("POST",
+                 f"/api/tests/{prep_tc}/prep-credentials/revoke",
+                 {"token": prep_tok, "prep_code": "x" * 16})
+    check("制备：指定不存在凭证撤销 404", s == 404, str(rr4))
+
+    # 撤销后重签：旧凭证始终失效，新凭证可用（但通道已关）
+    s, iss2 = req("POST", f"/api/tests/{prep_tc}/prep-credentials",
+                  {"token": prep_tok})
+    check("制备：撤销后可重签新凭证", s == 200 and iss2["prep_code"] != prep_code)
+    s, oldp = req("GET", f"/api/prep/{prep_code}/list")
+    check("制备：旧凭证重签后仍 403（始终失效）", s == 403, str(oldp))
+    s, pl4 = req("GET", f"/api/prep/{iss2['prep_code']}/list")
+    check("制备：新凭证可读但通道已关闭",
+          s == 200 and pl4["delivery_open"] is False
+          and pl4["progress"]["delivered"] == 2)
+
+    # 结算：发放记录保留在 assignments.delivered
+    s, settled_p = req("POST", f"/api/tests/{prep_tc}/settle",
+                       {"token": prep_tok})
+    check("制备：结算 200 且保留每人发放记录",
+          s == 200 and settled_p["assignments"] and
+          all("delivered" in a for a in settled_p["assignments"]),
+          str(settled_p)[:120])
+    deliv = {a["panelist"]: a["delivered"] for a in settled_p["assignments"]}
+    check("制备：结算结果发放标记正确（甲/乙已发，丁/戊未发，丙已撤回不在列）",
+          deliv.get("甲") is True and deliv.get("乙") is True
+          and deliv.get("丁") is False and deliv.get("戊") is False
+          and "丙" not in deliv, str(deliv))
+    # 已结算不再签发
+    s, ni = req("POST", f"/api/tests/{prep_tc}/prep-credentials",
+                {"token": prep_tok})
+    check("制备：结算后签发凭证 409", s == 409, str(ni))
+
+    # 时间线：prep_issue/prep_revoke/deliver 事件存在且不含杯贴明文/映射
+    s, tl = req("GET", f"/api/tests/{prep_tc}/timeline?token={prep_tok}")
+    etypes = [e["type"] for e in tl["events"]]
+    check("制备：时间线含签发/撤销/发放事件",
+          etypes.count("prep_issue") == 2 and etypes.count("prep_revoke") >= 1
+          and etypes.count("deliver") == 2, str(etypes))
+    tbl = json.dumps(tl, ensure_ascii=False)
+    check("制备：时间线不泄露杯贴码/真实样本/杯位映射",
+          "sticker" not in tbl and "茉莉" not in tbl and "玫瑰" not in tbl)
+
+    # 纯截止（未提前结束）场景：到点禁止新发放
+    s, dl = req("POST", "/api/tests", {
+        "sample_a": "X", "sample_b": "Y",
+        "panelists": ["q1", "q2"], "deadline": t["now"] + 1000,
+        "min_valid": 1})
+    dtc, dtok = dl["test_code"], dl["token"]
+    dpc = req("POST", f"/api/tests/{dtc}/prep-credentials",
+              {"token": dtok})[1]["prep_code"]
+    con.execute("UPDATE tests SET deadline=? WHERE code=?",
+                (int(time.time()) - 5, dtc))
+    con.commit()
+    s, dlist = req("GET", f"/api/prep/{dpc}/list")
+    check("制备：过截止清单可读但通道关闭",
+          s == 200 and dlist["delivery_open"] is False)
+    s, dd = req("POST", f"/api/prep/{dpc}/deliver", {"panelist": "q1"})
+    check("制备：过截止新发放 403", s == 403 and "截止" in dd["detail"], str(dd))
+
+    # --- 2.7 页面可达性 ---
+    for path in ("/", "/admin", "/eval", f"/eval/code/{codes[0]}", "/prep"):
         with urllib.request.urlopen(base + path, timeout=5) as r:
             check(f"页面 {path} → 200", r.status == 200 and b"<!DOCTYPE html>" in r.read(100))
 

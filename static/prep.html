@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>制备员制备台 · 三角嗅辨盲评</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container">
+  <header class="hero">
+    <h1>制备员制备台</h1>
+    <p>凭有效制备凭证查看制备清单，按评员整组三杯贴码并确认发放</p>
+  </header>
+  <div id="app"></div>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+const appEl = document.getElementById('app');
+
+// 支持 /prep?prep=<凭证> 或手动输入
+let prep = new URLSearchParams(location.search).get('prep');
+let timer = null;
+let busy = false;
+
+if (!prep) {
+  renderEntry();
+} else {
+  loadList();
+}
+
+function renderEntry() {
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>输入制备凭证</h2>
+      <form id="prepForm">
+        <label>制备凭证（负责人单独发放；撤销后立即失效）</label>
+        <input type="text" id="prepInput" required autocomplete="off"
+               style="letter-spacing:1px">
+        <button type="submit">查看制备清单</button>
+      </form>
+      <p class="small" style="margin-top:16px"><a href="/">返回首页</a></p>
+    </div>`;
+  document.getElementById('prepForm').addEventListener('submit', (e) => {
+    e.preventDefault();
+    prep = document.getElementById('prepInput').value.trim();
+    history.replaceState(null, '', `/prep?prep=${encodeURIComponent(prep)}`);
+    loadList();
+  });
+}
+
+async function loadList() {
+  try {
+    const d = await api(`/api/prep/${encodeURIComponent(prep)}/list`);
+    render(d);
+  } catch (err) {
+    clearInterval(timer);
+    const revoked = /撤销/.test(err.message);
+    appEl.innerHTML = `<div class="card">
+      <div class="callout err">${esc(err.message)}</div>
+      ${revoked ? '<p class="hint">该凭证已被负责人撤销，请联系负责人重新签发。</p>' : ''}
+      <button class="ghost" onclick="location.href='/prep'">重新输入凭证</button>
+    </div>`;
+  }
+}
+
+function render(d) {
+  clearInterval(timer);
+  const srvOffset = d.now - Date.now();
+  const remain = d.deadline - (Date.now() + srvOffset);
+  appEl.innerHTML = `
+    <div class="card">
+      <h2>制备清单 <span class="mono small">${esc(d.test_code)}</span></h2>
+      <p class="small">样本 A：<b>${esc(d.sample_a)}</b> ｜ 样本 B：<b>${esc(d.sample_b)}</b></p>
+      <p class="small">截止时间：<b>${fmtTime(d.deadline)}</b>
+        ｜ 剩余 <b id="countdown">${esc(fmtCountdown(remain))}</b></p>
+      ${!d.delivery_open ? `
+      <div class="callout no">
+        ${d.settled ? '测试已结算，' : d.ended ? '收集已提前结束，' : '已过截止时间，'}
+        <b>禁止新发放</b>；清单仅供核对，既有发放记录保留。
+      </div>` : `
+      <div class="callout warn">
+        请按每位评员的三杯明细贴杯贴：<b>整组三杯备齐后</b>再点「整组确认发放」。
+        重复确认不会重复记录；已发放评员不可撤回。
+      </div>`}
+      <div class="stat-grid">
+        <div class="stat"><div class="num">${d.progress.total}</div><div class="cap">待制备评员</div></div>
+        <div class="stat"><div class="num">${d.progress.delivered}</div><div class="cap">已整组发放</div></div>
+        <div class="stat"><div class="num">${d.progress.pending}</div><div class="cap">未发放</div></div>
+      </div>
+      <p class="hint">
+        杯贴码是每枚杯子的唯一身份码，<b>码面不含任何样本信息</b>；
+        请勿把杯贴码与样本对应关系透露给评员。
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>评员制备明细（按评员整组发放）</h2>
+      ${d.panelists.map((p, i) => `
+        <div class="prep-row ${p.delivered ? 'done' : ''}">
+          <div class="prep-head">
+            <b>${esc(p.panelist)}</b>
+            ${p.delivered
+              ? `<span class="badge ok">已于 ${fmtTime(p.delivered_at)} 整组发放</span>`
+              : '<span class="badge wait">未发放</span>'}
+            <span style="flex:1"></span>
+            ${(!p.delivered && d.delivery_open)
+              ? `<button data-deliver="${esc(p.panelist)}" class="prep-btn">整组确认发放</button>`
+              : ''}
+          </div>
+          <table>
+            <thead><tr><th>杯位</th><th>真实样本</th><th>杯贴码（贴杯，不含样本信息）</th></tr></thead>
+            <tbody>
+              ${p.cups.map(c => `
+                <tr>
+                  <td>${c.pos} 号杯</td>
+                  <td>样本 ${esc(c.sample_key)} ＝ <b>${esc(c.sample_name)}</b></td>
+                  <td class="code">${esc(c.sticker)}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`).join('')}
+      <div id="prepMsg"></div>
+    </div>`;
+
+  document.querySelectorAll('[data-deliver]').forEach((btn) => {
+    btn.addEventListener('click', () => deliver(btn.dataset.deliver, btn));
+  });
+
+  timer = setInterval(() => {
+    const el = document.getElementById('countdown');
+    if (el) el.textContent = fmtCountdown(d.deadline - (Date.now() + srvOffset));
+  }, 1000);
+}
+
+async function deliver(panelist, btn) {
+  if (busy) return;
+  if (!confirm(`确认评员「${panelist}」的三杯已整组备齐并发放？\n\n`
+      + '确认后该评员不可再被撤回；重复确认只返回原记录。')) return;
+  busy = true;
+  btn.disabled = true; btn.textContent = '确认中…';
+  try {
+    const r = await api(`/api/prep/${encodeURIComponent(prep)}/deliver`, {
+      method: 'POST',
+      body: { panelist },
+    });
+    const msgEl = document.getElementById('prepMsg');
+    if (msgEl) showInfo(msgEl,
+      (r.reused ? '该评员此前已确认发放，返回原记录（未重复记录）：' : '整组发放已记录：')
+      + `${r.panelist}，已发放 ${r.progress.delivered}/${r.progress.total}。`, 'ok');
+    loadList();
+  } catch (err) {
+    showErr(document.getElementById('prepMsg') || appEl, err.message);
+    btn.disabled = false; btn.textContent = '整组确认发放';
+    if (/撤销|截止|结束|结算/.test(err.message)) setTimeout(loadList, 800);
+  } finally {
+    busy = false;
+  }
+}
+</script>
+</body>
+</html>
